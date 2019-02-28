@@ -1,0 +1,13 @@
+os: linux
+dist: xenial
+sudo: false
+language: rust
+cache: cargo
+
+rust:
+ - stable
+ - nightly
+
+script:
+ - cargo build --verbose --all-targets
+ - cargo test --verbose
