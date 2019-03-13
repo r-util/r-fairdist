@@ -1,413 +1,372 @@
-//! Allocator
+//! Allocation Calculations
 //!
 //! This module implements the allocation calculations which the fair distribution algorithm is
-//! based on. At its core is the `[allocate()]` function, which performs quota checks and updates
-//! resource counters based on the selected algorithm.
-
-use std::sync::atomic;
-
-// Perform a generic operation on an atomic.
-//
-// This function performs an operation on an atomic value. Unlike on normal values, updating an
-// atomic might race with other updates. Hence, this function fetches the current atomic value,
-// calls the provided closure to calculate the next value, and then tries to update the atomic. If
-// the atomic changed in the meantime, the operation is retried.
-//
-// XXX: This function is available on all atomics in upstream rust, but currently marked as
-//      unstable. We should update to it as soon as it is stabilized.
-fn atomic_fetch_update<F>(
-    atomic: &atomic::AtomicUsize,
-    mut operator: F,
-    fetch_order: atomic::Ordering,
-    set_order: atomic::Ordering,
-) -> Result<usize, usize> where
-    F: FnMut(usize) -> Option<usize>
-{
-    let mut previous = atomic.load(fetch_order);
-
-    while let Some(next) = operator(previous) {
-        match atomic.compare_exchange_weak(previous, next, set_order, fetch_order) {
-            x @ Ok(_)       => return x,
-            Err(next_previous)  => previous = next_previous,
-        }
-    }
-
-    Err(previous)
-}
-
-// Calculate floored base-2 logarithm.
-//
-// This is an internal helper which calculates the base-2 logarithm of a `usize` value, rounding
-// down in case of missing precision.
-//
-// Note that this is only here for testing and documentational purposes. The `log2_ceil()` version
-// is the one we actually need.
-#[cfg(test)]
-fn log2_floor(v: usize) -> usize {
-    assert!{v > 0};
-    (std::mem::size_of::<usize>() * 8) as usize - v.leading_zeros() as usize - 1
-}
+//! based on. It defines a new trait `[Allocator]`, which abstracts the exact details how to
+//! divide a resource set amongst different requests. Furthermore, this module comes with a set of
+//! pre-defines allocator implementations, each with different properties and guarantees.
 
 // Calculate ceiled base-2 logarithm.
 //
-// This is an internal helper which calculates the base-2 logarithm of a `usize` value, rounding
-// up in case of missing precision.
-fn log2_ceil(v: usize) -> usize {
-    assert!{v > 0};
-    (std::mem::size_of::<usize>() * 8) as usize - (v - 1).leading_zeros() as usize
+// This is an internal helper which calculates the base-2 logarithm, rounding up in case of
+// missing precision.
+//
+// If `v` is 0, or negative, the function will produce a result, but does not give guarantees on
+// its value (currently, it will produce the maximum logarithm representable in `T`).
+fn log2_ceil<T>(v: &T) -> T where
+    T: crate::counter::Scalar +
+       num::FromPrimitive +
+       num::PrimInt,
+{
+    // XXX: There is currently no way to retrieve the bit-length of a `PrimInt`, even though it
+    //      is a well-defined concept, given that it can be calculated through other means:
+    //
+    //          * `zero().count_zeroes()`
+    //          * `x.count_zeros() + x.count_ones()`
+    //          * ...
+    //
+    //      There is an upstream bug-report about this. It might be as simple as using `size_of()`
+    //      but that needs to be explicitly documented. Until then, we use a version that can be
+    //      optimized by the compiler well enough.
+    let length: u32 = <T as num::Zero>::zero().count_zeros();
+
+    // This calculates the ceiled logarithm. What we do is count the leading zeros of the value in
+    // question and then substract it from its bit-length. By subtracting one from the value first
+    // we make sure the value is ceiled.
+    //
+    // Hint: To calculate the floored value, you would do the subtraction of 1 from the final
+    //       value, rather than from the source value: `length - v.leading_zeros() - 1`
+    //
+    // XXX: This should use `usize`, but upstream `num` has not fixed that, yet. They intend to
+    //      fix it with the next ABI break, whenever that happens.
+    let log2: u32 = length - (*v - num::One::one()).leading_zeros();
+
+    // Convert the value back into the source type. Since the source type must be an integer type,
+    // it must have a representation for all integers between its original and 0. Hence, this
+    // cannot fail.
+    <T as num::FromPrimitive>::from_u32(log2).unwrap()
 }
 
-/// Allocator with exponential guarantees.
+/// Abstraction to calculate constraints of an allocator
 ///
-/// This is a predefined allocator to be used in combination with `[allocate()]`.
+/// This trait abstracts over the exact algorithm used to divide a resource set amongst requests.
+/// The allocator cannot have state. All member methods are associated functions and never get
+/// access to `Self`.
+pub trait Allocator<S> where
+    S: crate::counter::Scalar,
+{
+    /// Calculate minimum reserve size given the parameters of an allocation request.
+    ///
+    /// This takes the three parameters of an allocation request and calculates the minimum
+    /// reserve size needed to grant this allocation. It takes the number of users that currently
+    /// hold shares (it must include the caller, so `users` cannot be `0`). Furthermore, `share`
+    /// contains the amount of resources already allocated to the caller (excluding `amount`)
+    /// Lastly, `amount` describes the amount of resources the allocation requests.
+    ///
+    /// This function returns the minimum size the reserve must have to grant this request. If the
+    /// reserve is bigger than, or equal to, this minimum, then the allocation can be safely
+    /// granted. The caller should then decrease the reserve, and increase the shares, by
+    /// `amount`.
+    /// If the minimum reserve cannot be represented in the domain of `S`, this function will
+    /// return `None`. This should be treated as an infinitely high minimum, and thus the
+    /// allocation should be rejected.
+    ///
+    /// Implementors must be careful about the constraints of the domain `S` during temporary
+    /// computations. This function must **not** return `None`, unless the final result cannot be
+    /// represented in `S`. That is, you should not return `None` just because an intermediate
+    /// value exceeds the domain of `S`. Instead, you must adjust your calculations to never
+    /// exceed the domain, or extend the domain of your intermediates.
+    fn minimum_reserve_for(
+        users: usize,
+        share: &S,
+        amount: &S,
+    ) -> Option<S>;
+}
+
+/// Allocator with exponential guarantees
+///
+/// This is a predefined allocator that implements `[Allocator]`.
 ///
 /// This allocator grants `1 / 2` of the remaining resources to every allocation. This
 /// guarantees every user gets a share proportional to `O(2^n)` of the total.
-pub fn allocate_exponential(previous: usize, _users: usize, share: usize, amount: usize) -> Option<usize> {
-    if let Some(limit) = share.checked_add(amount) {
-        if let Some(limit) = limit.checked_mul(2) {
-            if let Some(limit) = limit.checked_sub(share) {
-                if limit <= previous {
-                    return Some(previous - amount);
+pub struct Exponential {
+}
+
+impl<S> Allocator<S> for Exponential where
+    S: crate::counter::Scalar +
+       num::CheckedAdd +
+       num::CheckedMul +
+       num::CheckedSub +
+       num::FromPrimitive,
+{
+    fn minimum_reserve_for(
+        _users: usize,
+        share: &S,
+        amount: &S,
+    ) -> Option<S> {
+        if let Some(n) = num::FromPrimitive::from_usize(2) {
+            if let Some(limit) = share.checked_add(&amount) {
+                if let Some(limit) = limit.checked_mul(&n) {
+                    return limit.checked_sub(&share);
                 }
             }
         }
-    }
 
-    None
+        None
+    }
 }
 
-/// Allocator with polynomial guarantees.
+/// Allocator with polynomial guarantees
 ///
-/// This is a predefined allocator to be used in combination with `[allocate()]`.
+/// This is a predefined allocator that implements `[Allocator]`.
 ///
 /// This allocator grants `1 / (n+1)` of the remaining resources to every allocation. This
 /// guarantees every user gets a share proportional to `O(n^2)` of the total.
-pub fn allocate_polynomial(previous: usize, users: usize, share: usize, amount: usize) -> Option<usize> {
-    if let Some(limit) = share.checked_add(amount) {
-        if let Some(limit) = limit.checked_mul(users + 1) {
-            if let Some(limit) = limit.checked_sub(share) {
-                if limit <= previous {
-                    return Some(previous - amount);
+pub struct Polynomial {
+}
+
+impl<S> Allocator<S> for Polynomial where
+    S: crate::counter::Scalar +
+       num::CheckedAdd +
+       num::CheckedMul +
+       num::CheckedSub +
+       num::FromPrimitive,
+{
+    fn minimum_reserve_for(
+        users: usize,
+        share: &S,
+        amount: &S,
+    ) -> Option<S> {
+        if let Some(n) = num::FromPrimitive::from_usize(users + 1) {
+            if let Some(limit) = share.checked_add(amount) {
+                if let Some(limit) = limit.checked_mul(&n) {
+                    return limit.checked_sub(share);
                 }
             }
         }
-    }
 
-    None
+        None
+    }
 }
 
-/// Allocator with quasilinear guarantees.
+
+/// Allocator with quasilinear guarantees
 ///
-/// This is a predefined allocator to be used in combination with `[allocate()]`.
+/// This is a predefined allocator that implements `[Allocator]`.
 ///
 /// This allocator grants `1 / ((n+1) * log_2(n+1) + (n+1))` of the remaining resources to every
 /// allocation. This guarantees every user gets a share proportional to `O(n log(n)^2)` of the
 /// total.
-pub fn allocate_quasilinear(previous: usize, users: usize, share: usize, amount: usize) -> Option<usize> {
-    if let Some(n) = log2_ceil(users + 1).checked_mul(users + 1) {
-        if let Some(n) = n.checked_add(users + 1) {
-            if let Some(limit) = share.checked_add(amount) {
-                if let Some(limit) = limit.checked_mul(n) {
-                    if let Some(limit) = limit.checked_sub(share) {
-                        if limit <= previous {
-                            return Some(previous - amount);
+pub struct Quasilinear {
+}
+
+impl<S> Allocator<S> for Quasilinear where
+    S: crate::counter::Scalar +
+       num::CheckedAdd +
+       num::CheckedMul +
+       num::CheckedSub +
+       num::FromPrimitive +
+       num::PrimInt,
+{
+    fn minimum_reserve_for(
+        users: usize,
+        share: &S,
+        amount: &S,
+    ) -> Option<S> {
+        if let Some(users_plus_one) = num::FromPrimitive::from_usize(users + 1) {
+            if let Some(n) = log2_ceil::<S>(&users_plus_one).checked_mul(&users_plus_one) {
+                if let Some(n) = n.checked_add(&users_plus_one) {
+                    if let Some(limit) = share.checked_add(amount) {
+                        if let Some(limit) = limit.checked_mul(&n) {
+                            return limit.checked_sub(share);
                         }
                     }
                 }
             }
         }
+
+        None
     }
-
-    None
-}
-
-/// Fair Resource Allocator
-///
-/// This is the backend implementation of the actual resource allocator. This function takes a
-/// resource counter `resource_slot` and subtracts `amount` from it if, and only if, the
-/// allocation passes the quota checks. On success, true is returned. On failure, false is
-/// returned.
-///
-/// The quota checks are under control of the caller. The closure given as `operator` is passed
-/// all the allocation parameters, and then decides whether the allocation should take place or
-/// not.
-///
-/// This function operates in a lockless fashion. It first charges the new allocation on
-/// `share_slot`, which is the slot that remembers the allocations done so far by the calling
-/// user. It then calculates the maximum charge allowed to the calling user (which is based on its
-/// past allocations `share_slot`, on the number of active other users `users_slot` and the
-/// remaining resources `resource_slot`). If `amount` is less than, or equal to, the allowed
-/// charge, then it is substracted from `resource_slot`. If not, the charge on `share_slot` is
-/// reversed and `false` is returned.
-///
-/// The quota closure `operator` is used to check whether the final charge is allowed to happen.
-/// After `share_slot` was charged, the current values of `resource_slot` and `users_slot` are
-/// fetched and passed together with the initial value of `share_slot` and `amount` (in that
-/// order) to the closure. The closure should then return an `Option<usize>` that tells whether
-/// the allocation should succeed, and if it should, what to set `resource_slot` to. Since this
-/// might be called in a compare-and-swap loop, the function might be called multiple times in
-/// case other allocations race this one.
-///
-/// If in doubt, use `[allocate_quasilinear()]` as @operator. It is a fair allocator with best
-/// distribution and quasilinear allocation guarantees. Other allocators available include
-/// `[allocate_polynomial()]` and `[allocate_exponential()]`.
-pub fn allocate<F>(
-    resource_slot: &atomic::AtomicUsize,
-    users_slot: &atomic::AtomicUsize,
-    share_slot: &atomic::AtomicUsize,
-    mut operator: F,
-    amount: usize,
-) -> bool where
-    F: FnMut(usize, usize, usize, usize) -> Option<usize>
-{
-    if let Ok(share) =
-        atomic_fetch_update(
-            share_slot,
-            |previous| previous.checked_add(amount),
-            atomic::Ordering::Acquire,
-            atomic::Ordering::SeqCst,
-        )
-    {
-        if let Ok(_) =
-            atomic_fetch_update(
-                resource_slot,
-                |previous| {
-                    operator(
-                        previous,
-                        users_slot.load(atomic::Ordering::Acquire),
-                        share,
-                        amount,
-                    )
-                },
-                atomic::Ordering::Acquire,
-                atomic::Ordering::SeqCst,
-            )
-        {
-            return true;
-        }
-
-        let n = share_slot.fetch_sub(amount, atomic::Ordering::Release);
-        assert!{n >= amount};
-    }
-
-    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // The quasilinear allocators need base-2 logarithms on integers. We have two trivial
-    // implementations based on the `clz` (count-leading-zeroes) CPU features. This test simply
-    // verifies they work correctly.
+    // The quasilinear allocators need base-2 logarithms on integers. We have a fast
+    // implementation based on the `clz` (count-leading-zeroes) CPU features. This test simply
+    // verifies it works correctly.
     #[test]
     fn verify_log() {
-        assert_eq!{log2_floor( 1), 0};
-        assert_eq!{log2_floor( 2), 1};
-        assert_eq!{log2_floor( 3), 1};
-        assert_eq!{log2_floor( 4), 2};
-        assert_eq!{log2_floor( 5), 2};
-        assert_eq!{log2_floor( 6), 2};
-        assert_eq!{log2_floor( 7), 2};
-        assert_eq!{log2_floor( 8), 3};
-        assert_eq!{log2_floor( 9), 3};
-        assert_eq!{log2_floor(10), 3};
-        assert_eq!{log2_floor(11), 3};
-        assert_eq!{log2_floor(12), 3};
-        assert_eq!{log2_floor(13), 3};
-        assert_eq!{log2_floor(14), 3};
-        assert_eq!{log2_floor(15), 3};
-        assert_eq!{log2_floor(16), 4};
+        fn verify_log2_ceil<T>() where
+            T: crate::counter::Scalar +
+               num::FromPrimitive +
+               num::PrimInt +
+               num::ToPrimitive,
+        {
+            let tests: &[(u64, u64)] = &[
+                ( 1, 0), ( 2, 1), ( 3, 2), ( 4, 2),
+                ( 5, 3), ( 6, 3), ( 7, 3), ( 8, 3),
+                ( 9, 4), (10, 4), (11, 4), (12, 4),
+                (13, 4), (14, 4), (15, 4), (16, 4),
 
-        assert_eq!{log2_ceil( 1), 0};
-        assert_eq!{log2_ceil( 2), 1};
-        assert_eq!{log2_ceil( 3), 2};
-        assert_eq!{log2_ceil( 4), 2};
-        assert_eq!{log2_ceil( 5), 3};
-        assert_eq!{log2_ceil( 6), 3};
-        assert_eq!{log2_ceil( 7), 3};
-        assert_eq!{log2_ceil( 8), 3};
-        assert_eq!{log2_ceil( 9), 4};
-        assert_eq!{log2_ceil(10), 4};
-        assert_eq!{log2_ceil(11), 4};
-        assert_eq!{log2_ceil(12), 4};
-        assert_eq!{log2_ceil(13), 4};
-        assert_eq!{log2_ceil(14), 4};
-        assert_eq!{log2_ceil(15), 4};
-        assert_eq!{log2_ceil(16), 4};
+                ( 127,  7), ( 128,  7), ( 129,  8),
+                (1023, 10), (1024, 10), (1025, 11),
+
+                (std::u8::MAX as u64 - 1, 8),
+                (std::u8::MAX as u64 + 0, 8),
+                (std::u8::MAX as u64 + 1, 8),
+                (std::u8::MAX as u64 + 2, 9),
+
+                (std::u16::MAX as u64 - 1, 16),
+                (std::u16::MAX as u64 + 0, 16),
+                (std::u16::MAX as u64 + 1, 16),
+                (std::u16::MAX as u64 + 2, 17),
+
+                (std::u32::MAX as u64 - 1, 32),
+                (std::u32::MAX as u64 + 0, 32),
+                (std::u32::MAX as u64 + 1, 32),
+                (std::u32::MAX as u64 + 2, 33),
+
+                (std::u64::MAX as u64 - 1, 64),
+                (std::u64::MAX as u64 + 0, 64),
+            ];
+
+            for &(input, output) in tests {
+                if let Some(max) = <T as num::ToPrimitive>::to_u64(&<T as num::Bounded>::max_value()) {
+                    if input <= max {
+                        let p_input = <T as num::FromPrimitive>::from_u64(input).unwrap();
+                        let p_output = <T as num::FromPrimitive>::from_u64(output).unwrap();
+
+                        assert!{log2_ceil(&p_input) == p_output};
+                    }
+                }
+            }
+        }
+
+        verify_log2_ceil::<u8>();
+        verify_log2_ceil::<u16>();
+        verify_log2_ceil::<u32>();
+        verify_log2_ceil::<u64>();
+        verify_log2_ceil::<usize>();
     }
 
-    // This tests the behavior of the exponential allocator. We setup a resource pool of 1024,
+    // This tests the behavior of the exponential allocator. We simulate a resource pool of 1024,
     // which means the biggest allocation (which also has to be the first) is 512.
     //
     // The allocator we use grants everyone 1/2 of the remaining resources. It does *NOT* depend
     // on the number of active users, hence it is ignored in these tests.
     #[test]
     fn exponential_allocation() {
-        let op = allocate_exponential;
-        let r = atomic::AtomicUsize::new(1024);
-        let n = atomic::AtomicUsize::new(0);
-        let s1 = atomic::AtomicUsize::new(0);
-        let s2 = atomic::AtomicUsize::new(0);
+        let op = <Exponential as Allocator<usize>>::minimum_reserve_for;
 
         // As first step verify nothing bigger than 512 ever succeeds. We also try some values
         // that are known to trigger integer overflows. These should be caught by the
         // allocators correctly.
-        assert!{!allocate(&r, &n, &s1, op, 513)};
-        assert!{!allocate(&r, &n, &s1, op, 1024)};
-        assert!{!allocate(&r, &n, &s1, op, std::usize::MAX)};
+        assert!{op(1, &0, &513).unwrap() > 1024};
+        assert!{op(1, &0, &1024).unwrap() > 1024};
+        assert!{op(1, &0, &std::usize::MAX).is_none()};
 
-        assert_eq!{r.load(atomic::Ordering::SeqCst), 1024};
-        assert_eq!{s1.load(atomic::Ordering::SeqCst), 0};
-        assert_eq!{s2.load(atomic::Ordering::SeqCst), 0};
-
-        // Now try a full allocation of 512. This is the biggest allocation possible. Verify
-        // afterwards that the counters have been correctly updated.
-        assert!{allocate(&r, &n, &s1, op, 512)};
-
-        assert_eq!{r.load(atomic::Ordering::SeqCst), 512};
-        assert_eq!{s1.load(atomic::Ordering::SeqCst), 512};
-        assert_eq!{s2.load(atomic::Ordering::SeqCst), 0};
+        // Now try a full allocation of 512. This is the biggest allocation possible on our
+        // simulated pool of 1024.
+        assert_eq!{op(1, &0, &512).unwrap(), 1024};
 
         // Verify that this share is saturated and no further allocations are possible.
-        assert!{!allocate(&r, &n, &s1, op, 1)};
-        assert!{!allocate(&r, &n, &s1, op, 512)};
-        assert!{!allocate(&r, &n, &s1, op, 1024)};
-        assert!{!allocate(&r, &n, &s1, op, std::usize::MAX)};
+        assert!{op(1, &512, &1).unwrap() > 512};
+        assert!{op(1, &512, &512).unwrap() > 512};
+        assert!{op(1, &512, &1024).unwrap() > 512};
+        assert!{op(1, &512, &std::usize::MAX).is_none()};
 
-        // Now switch to the next share and try again. This time the maximum is 256 (half of the
-        // remaining 512). We perform the allocation in two steps 128 each. We then verify that
-        // this saturates the allocation.
-        assert!{!allocate(&r, &n, &s2, op, 257)};
-        assert!{!allocate(&r, &n, &s2, op, 512)};
-        assert!{!allocate(&r, &n, &s2, op, 1024)};
-        assert!{!allocate(&r, &n, &s2, op, std::usize::MAX)};
+        // Now switch to the next virtual share and try again. This time the maximum is 256 (half
+        // of the remaining 512). We perform the allocation in two steps 128 each. We then verify
+        // that this saturates the allocation.
+        assert!{op(2, &0, &257).unwrap() > 512};
+        assert!{op(2, &0, &512).unwrap() > 512};
+        assert!{op(2, &0, &1024).unwrap() > 512};
+        assert!{op(2, &0, &std::usize::MAX).is_none()};
 
-        assert!{allocate(&r, &n, &s2, op, 128)};
-        assert!{allocate(&r, &n, &s2, op, 128)};
-        assert!{!allocate(&r, &n, &s2, op, 1)};
+        assert!{op(2, &0, &128).unwrap() <= 512};
+        assert_eq!{op(2, &128, &128).unwrap(), 384};
 
-        assert_eq!{r.load(atomic::Ordering::SeqCst), 256};
-        assert_eq!{s1.load(atomic::Ordering::SeqCst), 512};
-        assert_eq!{s2.load(atomic::Ordering::SeqCst), 256};
+        assert!{op(2, &256, &1).unwrap() > 256};
     }
 
-    // This tests the behavior of the polynomial allocator. We setup a resource pool of 1024,
+    // This tests the behavior of the polynomial allocator. We simulate a resource pool of 1024,
     // which means the biggest allocation (which also has to be the first) is 512.
     //
     // The allocator we use grants everyone an n-plus-1'th of the remaining resources. Hence, we
     // need to update @n according to the current number of peers.
     #[test]
     fn polynomial_allocation() {
-        let op = allocate_polynomial;
-        let r = atomic::AtomicUsize::new(1024);
-        let n = atomic::AtomicUsize::new(0);
-        let s1 = atomic::AtomicUsize::new(0);
-        let s2 = atomic::AtomicUsize::new(0);
+        let op = <Polynomial as Allocator<usize>>::minimum_reserve_for;
 
         // As first step verify nothing bigger than 512 ever succeeds. We also try some values
         // that are known to trigger integer overflows. These should be caught by the
         // allocators correctly.
-        n.fetch_add(1, atomic::Ordering::SeqCst);
+        assert!{op(1, &0, &513).unwrap() > 1024};
+        assert!{op(1, &0, &1024).unwrap() > 1024};
+        assert!{op(1, &0, &std::usize::MAX).is_none()};
 
-        assert!{!allocate(&r, &n, &s1, op, 513)};
-        assert!{!allocate(&r, &n, &s1, op, 1024)};
-        assert!{!allocate(&r, &n, &s1, op, std::usize::MAX)};
-
-        assert_eq!{r.load(atomic::Ordering::SeqCst), 1024};
-        assert_eq!{s1.load(atomic::Ordering::SeqCst), 0};
-        assert_eq!{s2.load(atomic::Ordering::SeqCst), 0};
-
-        // Now try a full allocation of 512. This is the biggest allocation possible. Verify
-        // afterwards that the counters have been correctly updated.
-        assert!{allocate(&r, &n, &s1, op, 512)};
-
-        assert_eq!{r.load(atomic::Ordering::SeqCst), 512};
-        assert_eq!{s1.load(atomic::Ordering::SeqCst), 512};
-        assert_eq!{s2.load(atomic::Ordering::SeqCst), 0};
+        // Now try a full allocation of 512. This is the biggest allocation possible on our
+        // simulated pool of 1024.
+        assert_eq!{op(1, &0, &512).unwrap(), 1024};
 
         // Verify that this share is saturated and no further allocations are possible.
-        assert!{!allocate(&r, &n, &s1, op, 1)};
-        assert!{!allocate(&r, &n, &s1, op, 512)};
-        assert!{!allocate(&r, &n, &s1, op, 1024)};
-        assert!{!allocate(&r, &n, &s1, op, std::usize::MAX)};
+        assert!{op(1, &512, &1).unwrap() > 512};
+        assert!{op(1, &512, &512).unwrap() > 512};
+        assert!{op(1, &512, &1024).unwrap() > 512};
+        assert!{op(1, &512, &std::usize::MAX).is_none()};
 
         // Now switch to the next share and try again. This time the maximum is a third of 512,
         // which is 170. We split it in two allocations of 85 each, to verify split allocations
         // work the same way.
-        n.fetch_add(1, atomic::Ordering::SeqCst);
+        assert!{op(2, &0, &171).unwrap() > 512};
+        assert!{op(2, &0, &512).unwrap() > 512};
+        assert!{op(2, &0, &1024).unwrap() > 512};
+        assert!{op(2, &0, &std::usize::MAX).is_none()};
 
-        assert!{!allocate(&r, &n, &s2, op, 171)};
-        assert!{!allocate(&r, &n, &s2, op, 512)};
-        assert!{!allocate(&r, &n, &s2, op, 1024)};
-        assert!{!allocate(&r, &n, &s2, op, std::usize::MAX)};
+        assert!{op(2, &0, &85).unwrap() <= 512};
+        assert_eq!{op(2, &85, &85).unwrap(), 425}; // should be 427, but lacking precision
 
-        assert!{allocate(&r, &n, &s2, op, 85)};
-        assert!{allocate(&r, &n, &s2, op, 85)};
-        assert!{!allocate(&r, &n, &s2, op, 1)};
-
-        assert_eq!{r.load(atomic::Ordering::SeqCst), 342};
-        assert_eq!{s1.load(atomic::Ordering::SeqCst), 512};
-        assert_eq!{s2.load(atomic::Ordering::SeqCst), 170};
+        assert!{op(2, &170, &1).unwrap() > 342};
     }
 
-    // This tests the behavior of the quasilinear allocator. We setup a resource pool of 1024,
+    // This tests the behavior of the quasilinear allocator. We simulate a resource pool of 1024,
     // which means the biggest allocation (which also has to be the first) is 256.
     //
     // The allocator we use grants everyone `1 / ((n+1) * log_2(n+1) + (n+1))` of the remaining
     // resources.
     #[test]
     fn quasilinear_allocation() {
-        let op = allocate_quasilinear;
-        let r = atomic::AtomicUsize::new(1024);
-        let n = atomic::AtomicUsize::new(0);
-        let s1 = atomic::AtomicUsize::new(0);
-        let s2 = atomic::AtomicUsize::new(0);
+        let op = <Quasilinear as Allocator<usize>>::minimum_reserve_for;
 
         // As first step verify nothing bigger than 256 ever succeeds. We also try some values
         // that are known to trigger integer overflows. These should be caught by the
         // allocators correctly.
-        n.fetch_add(1, atomic::Ordering::SeqCst);
+        assert!{op(1, &0, &257).unwrap() > 1024};
+        assert!{op(1, &0, &1024).unwrap() > 1024};
+        assert!{op(1, &0, &std::usize::MAX).is_none()};
 
-        assert!{!allocate(&r, &n, &s1, op, 257)};
-        assert!{!allocate(&r, &n, &s1, op, 1024)};
-        assert!{!allocate(&r, &n, &s1, op, std::usize::MAX)};
-
-        assert_eq!{r.load(atomic::Ordering::SeqCst), 1024};
-        assert_eq!{s1.load(atomic::Ordering::SeqCst), 0};
-        assert_eq!{s2.load(atomic::Ordering::SeqCst), 0};
-
-        // Now try a full allocation of 256. This is the biggest allocation possible. Verify
-        // afterwards that the counters have been correctly updated.
-        assert!{allocate(&r, &n, &s1, op, 256)};
-
-        assert_eq!{r.load(atomic::Ordering::SeqCst), 768};
-        assert_eq!{s1.load(atomic::Ordering::SeqCst), 256};
-        assert_eq!{s2.load(atomic::Ordering::SeqCst), 0};
+        // Now try a full allocation of 256. This is the biggest allocation possible on our
+        // simulated pool of 1024.
+        assert_eq!{op(1, &0, &256).unwrap(), 1024};
 
         // Verify that this share is saturated and no further allocations are possible.
-        assert!{!allocate(&r, &n, &s1, op, 1)};
-        assert!{!allocate(&r, &n, &s1, op, 512)};
-        assert!{!allocate(&r, &n, &s1, op, 1024)};
-        assert!{!allocate(&r, &n, &s1, op, std::usize::MAX)};
+        assert!{op(1, &256, &1).unwrap() > 768};
+        assert!{op(1, &256, &256).unwrap() > 768};
+        assert!{op(1, &256, &1024).unwrap() > 768};
+        assert!{op(1, &256, &std::usize::MAX).is_none()};
 
         // Now switch to the next share and try again. This time the maximum is a nineth of 512,
         // which is 85.3~. We split it in two allocations of 40 and 45, to verify split
         // allocations work the same way.
-        n.fetch_add(1, atomic::Ordering::SeqCst);
+        assert!{op(2, &0, &86).unwrap() > 768};
+        assert!{op(2, &0, &256).unwrap() > 768};
+        assert!{op(2, &0, &1024).unwrap() > 768};
+        assert!{op(2, &0, &std::usize::MAX).is_none()};
 
-        assert!{!allocate(&r, &n, &s2, op, 86)};
-        assert!{!allocate(&r, &n, &s2, op, 512)};
-        assert!{!allocate(&r, &n, &s2, op, 1024)};
-        assert!{!allocate(&r, &n, &s2, op, std::usize::MAX)};
+        assert!{op(2, &0, &40).unwrap() <= 768};
+        assert_eq!{op(2, &40, &45).unwrap(), 725}; // should be 728, but lacking precision
 
-        assert!{allocate(&r, &n, &s2, op, 40)};
-        assert!{allocate(&r, &n, &s2, op, 45)};
-        assert!{!allocate(&r, &n, &s2, op, 1)};
-
-        assert_eq!{r.load(atomic::Ordering::SeqCst), 683};
-        assert_eq!{s1.load(atomic::Ordering::SeqCst), 256};
-        assert_eq!{s2.load(atomic::Ordering::SeqCst), 85};
+        assert!{op(2, &85, &1).unwrap() > 683};
     }
 }
