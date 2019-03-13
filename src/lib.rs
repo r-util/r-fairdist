@@ -329,6 +329,20 @@ impl<A, C, I> Subscription<A, C, I> where
     fn deref(&self) -> &Usage<A, C, I> {
         self.usage_ref.as_ref().unwrap()
     }
+
+    /// Create a new charge.
+    ///
+    /// This is a shortcut for creating a new `[Charge]` object and calling `[Charge::charge()]`.
+    /// If the charge request succeeds, this function returns the `[Charge]` object. Otherwise,
+    /// `None` is returned.
+    pub fn charge(&self, slot: &C::Index, amount: &C::Scalar) -> Option<Charge<A, C, I>> {
+        let mut charge = Charge::new(self.clone(), slot);
+
+        match charge.charge(amount) {
+            true => Some(charge),
+            false => None,
+        }
+    }
 }
 
 impl<A, C, I> Drop for Subscription<A, C, I> where
