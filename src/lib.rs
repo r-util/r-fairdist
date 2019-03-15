@@ -78,6 +78,15 @@ struct Usage<A, C, I> where
     share: std::cell::RefCell<C>,
 }
 
+// `Usage` is not `Sync`, since it contains a `RefCell`. However, we protect that cell with the
+// mutex in the registry. Hence, mark it explicitly as `Sync`.
+unsafe impl<A, C, I> Sync for Usage<A, C, I> where
+    A: allocator::Allocator<C::Scalar>,
+    C: counter::Counter,
+    I: Clone + Ord,
+{
+}
+
 // Resource registry
 //
 // A resource registry is the hidden root object for resource distribution. The registry tracks
