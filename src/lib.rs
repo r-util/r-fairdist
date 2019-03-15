@@ -39,6 +39,12 @@
 //! The default allocator guarantees quasilinear shares to every user of the system. In
 //! particular, this means regardless how many users join the allocation system, each one is
 //! guaranteed a share of 1 over `O(n * log(n)^2)` of the total.
+//!
+//! # Proof
+//!
+//! A simplified model of the algorithm behind `r-fairdist` has been verified for soundness. Check
+//! out the [first version](https://dvdhrm.github.io/fairdist-v1/) of this proof if you are
+//! interested.
 
 use std::sync::{Arc, Weak};
 
